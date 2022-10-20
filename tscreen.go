@@ -1,4 +1,4 @@
-// Copyright 2021 The TCell Authors
+// Copyright 2022 The TCell Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use file except in compliance with the License.
@@ -134,7 +134,6 @@ type tScreen struct {
 	clear        bool
 	cursorx      int
 	cursory      int
-	wasbtn       bool
 	acs          map[rune]string
 	charset      string
 	encoder      transform.Transformer
@@ -148,6 +147,9 @@ type tScreen struct {
 	finiOnce     sync.Once
 	enablePaste  string
 	disablePaste string
+	enterUrl     string
+	exitUrl      string
+	setWinSize   string
 	cursorStyles map[CursorStyle]string
 	cursorStyle  CursorStyle
 	saved        *term.State
@@ -196,9 +198,13 @@ func (t *tScreen) Init() error {
 	if os.Getenv("TCELL_TRUECOLOR") == "disable" {
 		t.truecolor = false
 	}
-	t.colors = make(map[Color]Color)
-	t.palette = make([]Color, t.nColors())
-	for i := 0; i < t.nColors(); i++ {
+	nColors := t.nColors()
+	if nColors > 256 {
+		nColors = 256 // clip to reasonable limits
+	}
+	t.colors = make(map[Color]Color, nColors)
+	t.palette = make([]Color, nColors)
+	for i := 0; i < nColors; i++ {
 		t.palette[i] = Color(i) | ColorValid
 		// identity map for our builtin colors
 		t.colors[Color(i)|ColorValid] = Color(i) | ColorValid
@@ -331,6 +337,26 @@ func (t *tScreen) prepareBracketedPaste() {
 		t.disablePaste = "\x1b[?2004l"
 		t.prepareKey(keyPasteStart, "\x1b[200~")
 		t.prepareKey(keyPasteEnd, "\x1b[201~")
+	}
+}
+
+func (t *tScreen) prepareExtendedOSC() {
+	// More stuff for limits in terminfo.  This time we are applying
+	// the most common OSC (operating system commands).  Generally
+	// terminals that don't understand these will ignore them.
+	// Again, we condition this based on mouse capabilities.
+	if t.ti.EnterUrl != "" {
+		t.enterUrl = t.ti.EnterUrl
+		t.exitUrl = t.ti.ExitUrl
+	} else if t.ti.Mouse != "" {
+		t.enterUrl = "\x1b]8;%p2%s;%p1%s\x1b\\"
+		t.exitUrl = "\x1b]8;;\x1b\\"
+	}
+
+	if t.ti.SetWindowSize != "" {
+		t.setWinSize = t.ti.SetWindowSize
+	} else if t.ti.Mouse != "" {
+		t.setWinSize = "\x1b[8;%p1%p2%d;%dt"
 	}
 }
 
@@ -502,6 +528,7 @@ func (t *tScreen) prepareKeys() {
 	t.prepareXtermModifiers()
 	t.prepareBracketedPaste()
 	t.prepareCursorStyles()
+	t.prepareExtendedOSC()
 
 outer:
 	// Add key mappings for control keys.
@@ -623,11 +650,27 @@ func (t *tScreen) encodeRune(r rune, buf []byte) []byte {
 	return buf
 }
 
-func (t *tScreen) sendFgBg(fg Color, bg Color) {
+func (t *tScreen) sendFgBg(fg Color, bg Color, attr AttrMask) AttrMask {
 	ti := t.ti
 	if ti.Colors == 0 {
-		return
+		// foreground vs background, we calculate luminance
+		// and possibly do a reverse video
+		if !fg.Valid() {
+			return attr
+		}
+		v, ok := t.colors[fg]
+		if !ok {
+			v = FindColor(fg, []Color{ColorBlack, ColorWhite})
+			t.colors[fg] = v
+		}
+		switch v {
+		case ColorWhite:
+			return attr
+		case ColorBlack:
+			return attr ^ AttrReverse
+		}
 	}
+
 	if fg == ColorReset || bg == ColorReset {
 		t.TPuts(ti.ResetFgBg)
 	}
@@ -638,7 +681,7 @@ func (t *tScreen) sendFgBg(fg Color, bg Color) {
 			t.TPuts(ti.TParm(ti.SetFgBgRGB,
 				int(r1), int(g1), int(b1),
 				int(r2), int(g2), int(b2)))
-			return
+			return attr
 		}
 
 		if fg.IsRGB() && ti.SetFgRGB != "" {
@@ -685,6 +728,7 @@ func (t *tScreen) sendFgBg(fg Color, bg Color) {
 			t.TPuts(ti.TParm(ti.SetBg, int(bg&0xff)))
 		}
 	}
+	return attr
 }
 
 func (t *tScreen) drawCell(x, y int) int {
@@ -727,7 +771,7 @@ func (t *tScreen) drawCell(x, y int) int {
 
 		t.TPuts(ti.AttrOff)
 
-		t.sendFgBg(fg, bg)
+		attrs = t.sendFgBg(fg, bg, attrs)
 		if attrs&AttrBold != 0 {
 			t.TPuts(ti.Bold)
 		}
@@ -749,8 +793,19 @@ func (t *tScreen) drawCell(x, y int) int {
 		if attrs&AttrStrikeThrough != 0 {
 			t.TPuts(ti.StrikeThrough)
 		}
+
+		// URL string can be long, so don't send it unless we really need to
+		if t.enterUrl != "" && t.curstyle != style {
+			if style.url != "" {
+				t.TPuts(ti.TParm(t.enterUrl, style.url, style.urlId))
+			} else {
+				t.TPuts(t.exitUrl)
+			}
+		}
+
 		t.curstyle = style
 	}
+
 	// now emit runes - taking care to not overrun width with a
 	// wide character, and to ensure that we emit exactly one regular
 	// character followed up by any residual combing characters
@@ -858,8 +913,10 @@ func (t *tScreen) Show() {
 }
 
 func (t *tScreen) clearScreen() {
+	t.TPuts(t.ti.AttrOff)
+	t.TPuts(t.exitUrl)
 	fg, bg, _ := t.style.Decompose()
-	t.sendFgBg(fg, bg)
+	_ = t.sendFgBg(fg, bg, AttrNone)
 	t.TPuts(t.ti.Clear)
 	t.clear = false
 }
@@ -877,9 +934,11 @@ func (t *tScreen) hideCursor() {
 }
 
 func (t *tScreen) draw() {
-	// clobber cursor position, because we're gonna change it all
+	// clobber cursor position, because we're going to change it all
 	t.cx = -1
 	t.cy = -1
+	// make no style assumptions
+	t.curstyle = styleInvalid
 
 	t.buf.Reset()
 	t.buffering = true
@@ -948,8 +1007,9 @@ func (t *tScreen) enableMouse(f MouseFlags) {
 		if f&MouseMotionEvents != 0 {
 			t.TPuts("\x1b[?1003h")
 		}
-
-		t.TPuts("\x1b[?1006h")
+		if f&(MouseButtonEvents|MouseDragEvents|MouseMotionEvents) != 0 {
+			t.TPuts("\x1b[?1006h")
+		}
 	}
 
 }
@@ -1062,7 +1122,7 @@ func (t *tScreen) HasPendingEvent() bool {
 // the terminals Alternate Character Set to represent other glyphs.
 // For example, the upper left corner of the box drawing set can be
 // displayed by printing "l" while in the alternate character set.
-// Its not quite that simple, since the "l" is the terminfo name,
+// It's not quite that simple, since the "l" is the terminfo name,
 // and it may be necessary to use a different character based on
 // the terminal implementation (or the terminal may lack support for
 // this altogether).  See buildAcsMap below for detail.
@@ -1172,28 +1232,16 @@ func (t *tScreen) buildMouseEvent(x, y, btn int) *EventMouse {
 	switch btn & 0x43 {
 	case 0:
 		button = Button1
-		t.wasbtn = true
 	case 1:
 		button = Button3 // Note we prefer to treat right as button 2
-		t.wasbtn = true
 	case 2:
 		button = Button2 // And the middle button as button 3
-		t.wasbtn = true
 	case 3:
 		button = ButtonNone
-		t.wasbtn = false
 	case 0x40:
-		if !t.wasbtn {
-			button = WheelUp
-		} else {
-			button = Button1
-		}
+		button = WheelUp
 	case 0x41:
-		if !t.wasbtn {
-			button = WheelDown
-		} else {
-			button = Button2
-		}
+		button = WheelDown
 	}
 
 	if btn&0x4 != 0 {
@@ -1583,7 +1631,7 @@ func (t *tScreen) mainLoop(stopQ chan struct{}) {
 		case <-t.keytimer.C:
 			// If the timer fired, and the current time
 			// is after the expiration of the escape sequence,
-			// then we assume the escape sequence reached it's
+			// then we assume the escape sequence reached its
 			// conclusion, and process the chunk independently.
 			// This lets us detect conflicts such as a lone ESC.
 			if buf.Len() > 0 {
@@ -1712,6 +1760,14 @@ func (t *tScreen) HasKey(k Key) bool {
 	return t.keyexist[k]
 }
 
+func (t *tScreen) SetSize(w, h int) {
+	if t.setWinSize != "" {
+		t.TPuts(t.ti.TParm(t.setWinSize, w, h))
+	}
+	t.cells.Invalidate()
+	t.resize()
+}
+
 func (t *tScreen) Resize(int, int, int, int) {}
 
 func (t *tScreen) Suspend() error {
@@ -1724,7 +1780,7 @@ func (t *tScreen) Resume() error {
 }
 
 // engage is used to place the terminal in raw mode and establish screen size, etc.
-// Thing of this is as tcell "engaging" the clutch, as it's going to be driving the
+// Think of this is as tcell "engaging" the clutch, as it's going to be driving the
 // terminal interface.
 func (t *tScreen) engage() error {
 	t.Lock()
